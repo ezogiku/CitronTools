@@ -1,13 +1,26 @@
 bl_info = {
+# Citron_Tools/__init__.py の bl_info を以下のように更新します
+
+bl_info = {
     "name": "Citron Tools",
-    "author": "Chat Companion & You",
-    "version": (1, 2, 0),
+    "author": "Chat Companion & ezogiku",
+    "version": (1, 2, 0),  # ★バージョン番号は更新時に変更します
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Citron Tools",
     "description": "オブジェクトリストのエクスポートなど、便利なツールを集めたアドオン",
     "warning": "",
-    "doc_url": "",
+    
+    # --- ここからがエクステンション対応のための追加項目 ---
+    "support": "COMMUNITY",
+    # ダウンロードURL: GitHubリリースのZIPファイルを指します
+    "download_url": "https://github.com/ezogiku/CitronTools/releases/latest/download/Citron_Tools.zip",
+    # バグ報告用のURL: GitHubのIssuesページ
+    "tracker_url": "https://github.com/ezogiku/CitronTools/issues",
+    # ドキュメントURL: GitHubリポジトリのトップページなど
+    "doc_url": "https://github.com/ezogiku/CitronTools",
+    
     "category": "3D View",
+}
 }
 
 import bpy
