@@ -16,6 +16,7 @@ bl_info = {
 
 import bpy
 
+# 他のファイルからクラスをインポート
 from .operators.export_object_list import CITRON_OT_ExportObjectList
 from .ui.collection_list import (
     CITRON_CollectionListItem,
@@ -25,6 +26,7 @@ from .ui.collection_list import (
     CITRON_OT_RemoveCollectionItem
 )
 
+# パネルクラスの定義（UIの見た目）
 class CITRON_PT_MainPanel(bpy.types.Panel):
     bl_label = "Citron Tools"
     bl_idname = "CITRON_PT_MainPanel"
@@ -36,6 +38,7 @@ class CITRON_PT_MainPanel(bpy.types.Panel):
         layout = self.layout
         settings = context.scene.citron_tool_settings
 
+        # 設定エリア
         box = layout.box()
         box.label(text="Base Collection Settings", icon='OUTLINER_COLLECTION')
         
@@ -52,10 +55,12 @@ class CITRON_PT_MainPanel(bpy.types.Panel):
         
         layout.separator()
 
+        # 実行エリア
         box2 = layout.box()
         box2.label(text="Export", icon='EXPORT')
         box2.operator(CITRON_OT_ExportObjectList.bl_idname)
 
+# 登録するクラスのリスト
 classes = (
     CITRON_OT_ExportObjectList,
     CITRON_CollectionListItem,
@@ -63,15 +68,17 @@ classes = (
     CITRON_UL_CollectionList,
     CITRON_OT_AddCollectionItem,
     CITRON_OT_RemoveCollectionItem,
-    CITron_PT_MainPanel,
+    CITRON_PT_MainPanel,  # ここで使う名前と...
 )
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    # シーンプロパティにアドオンの設定を追加
     bpy.types.Scene.citron_tool_settings = bpy.props.PointerProperty(type=CITRON_ToolSettings)
 
 def unregister():
+    # シーンプロパティからアドオンの設定を削除
     del bpy.types.Scene.citron_tool_settings
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
