@@ -1,0 +1,190 @@
+bl_info = {
+    "name": "Bone Chain to Mesh",
+    "author": "Chat Companion",
+    "version": (1, 3, 0), # バージョンを更新
+    "blender": (4, 0, 0),
+    "location": "View3D > Sidebar > Bone Chain Mesh Tab",
+    "description": "指定プレフィックスのボーンチェーンをメッシュ化します。末端ボーンはテール位置にも頂点を生成します。",
+    "warning": "",
+    "doc_url": "",
+    "category": "Object",
+}
+
+import bpy
+
+def get_target_bones(armature_obj, prefix):
+    """指定されたプレフィックスを持つボーンをアーマチュアから取得し、名前順でソートして返す"""
+    if not armature_obj or armature_obj.type != 'ARMATURE':
+        return []
+    
+    armature_data = armature_obj.data
+    target_bones = [bone for bone in armature_data.bones if bone.name.startswith(prefix)]
+    
+    # 確実な順序でエッジを生成するためにボーン名をソートする
+    target_bones.sort(key=lambda bone: bone.name)
+    
+    return target_bones
+
+class BONECHAIN_OT_convert_to_mesh(bpy.types.Operator):
+    """指定されたボーンチェーンから頂点とエッジのメッシュを生成する"""
+    bl_idname = "object.bone_chain_to_mesh"
+    bl_label = "Generate Mesh from Bone Chain"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.bone_chain_tool_props
+        return props.armature_object is not None and props.bone_prefix != ""
+
+    def execute(self, context):
+        props = context.scene.bone_chain_tool_props
+        armature_obj = props.armature_object
+        prefix = props.bone_prefix
+
+        if not armature_obj or armature_obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "アーマチュアオブジェクトが選択されていません。")
+            return {'CANCELLED'}
+        if not prefix:
+            self.report({'ERROR'}, "ボーンのプレフィックスを入力してください。")
+            return {'CANCELLED'}
+
+        target_bones = get_target_bones(armature_obj, prefix)
+        if not target_bones:
+            self.report({'WARNING'}, f"プレフィックス '{prefix}' を持つボーンが見つかりませんでした。")
+            return {'CANCELLED'}
+        
+        self.report({'INFO'}, f"{len(target_bones)}個のボーンをメッシュに変換します。")
+
+        verts = []
+        edges = []
+        bone_name_to_head_v_idx = {}
+        bone_name_to_all_v_indices = {}
+        arm_matrix_world = armature_obj.matrix_world
+        
+        # 効率的な検索のためにボーン名のセットを作成
+        target_bone_names = {b.name for b in target_bones}
+
+        # --- 1. すべてのボーンのHead位置に頂点を生成 ---
+        for bone in target_bones:
+            head_coord = arm_matrix_world @ bone.head_local
+            vert_idx = len(verts)
+            verts.append(head_coord)
+            bone_name_to_head_v_idx[bone.name] = vert_idx
+            
+            # ウェイト割り当て用に頂点インデックスを記録
+            if bone.name not in bone_name_to_all_v_indices:
+                bone_name_to_all_v_indices[bone.name] = []
+            bone_name_to_all_v_indices[bone.name].append(vert_idx)
+
+        # --- 2. エッジの生成と、末端ボーンのTail位置の頂点生成 ---
+        for bone in target_bones:
+            # 親子関係のエッジを生成
+            if bone.parent and bone.parent.name in target_bone_names:
+                parent_idx = bone_name_to_head_v_idx[bone.parent.name]
+                child_idx = bone_name_to_head_v_idx[bone.name]
+                edges.append((parent_idx, child_idx))
+            
+            # このボーンが末端かどうかを判定
+            # (子ボーンの中に、対象プレフィックスを持つものが一つも無いか)
+            is_terminal = not any(child.name in target_bone_names for child in bone.children)
+            
+            if is_terminal:
+                head_idx = bone_name_to_head_v_idx[bone.name]
+                tail_coord = arm_matrix_world @ bone.tail_local
+                
+                # Tail位置に新しい頂点を追加
+                tail_idx = len(verts)
+                verts.append(tail_coord)
+                
+                # HeadとTailを結ぶエッジを追加
+                edges.append((head_idx, tail_idx))
+                
+                # Tailの頂点インデックスもウェイト割り当て用に記録
+                bone_name_to_all_v_indices[bone.name].append(tail_idx)
+
+
+        # --- 3. メッシュオブジェクトの作成 ---
+        mesh_name = f"{armature_obj.name}_{prefix}Mesh"
+        mesh_data = bpy.data.meshes.new(name=mesh_name)
+        new_obj = bpy.data.objects.new(name=mesh_name, object_data=mesh_data)
+        
+        mesh_data.from_pydata(verts, edges, [])
+        mesh_data.update()
+        context.collection.objects.link(new_obj)
+
+        # --- 4. 頂点グループの作成とウェイト割り当て ---
+        for bone_name, v_indices in bone_name_to_all_v_indices.items():
+            if not v_indices:
+                continue
+            vgroup = new_obj.vertex_groups.new(name=bone_name)
+            vgroup.add(v_indices, 1.0, 'REPLACE')
+
+        # --- 5. アーマチュアモディファイアの追加 ---
+        modifier = new_obj.modifiers.new(name="Armature", type='ARMATURE')
+        modifier.object = armature_obj
+        
+        bpy.ops.object.select_all(action='DESELECT')
+        new_obj.select_set(True)
+        context.view_layer.objects.active = new_obj
+
+        self.report({'INFO'}, f"メッシュ '{new_obj.name}' が正常に生成されました。")
+        return {'FINISHED'}
+
+
+class BONECHAIN_PT_panel(bpy.types.Panel):
+    """ボーンチェーンをメッシュ化する機能のUIパネル"""
+    bl_label = "Bone Chain to Mesh"
+    bl_idname = "OBJECT_PT_bone_chain_to_mesh"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Bone Chain Mesh' 
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.bone_chain_tool_props
+
+        col = layout.column(align=True)
+        col.label(text="設定:")
+        col.prop(props, "armature_object", text="アーマチュア")
+        col.prop(props, "bone_prefix", text="ボーンのプレフィックス")
+        
+        layout.separator()
+        
+        row = layout.row()
+        row.scale_y = 1.5
+        row.operator(BONECHAIN_OT_convert_to_mesh.bl_idname, text="メッシュを生成", icon='MOD_WIREFRAME')
+
+class BoneChainToolProperties(bpy.types.PropertyGroup):
+    """アドオン用のプロパティを格納するクラス"""
+    armature_object: bpy.props.PointerProperty(
+        name="Armature Object",
+        description="メッシュ化の元となるボーンを持つアーマチュアオブジェクト",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'ARMATURE'
+    )
+    
+    bone_prefix: bpy.props.StringProperty(
+        name="Bone Prefix",
+        description="メッシュに変換したいボーンチェーンのプレフィックス（例: 'Chain_A_ '）",
+        default=""
+    )
+
+# 登録クラスのリスト
+classes = (
+    BoneChainToolProperties,
+    BONECHAIN_OT_convert_to_mesh,
+    BONECHAIN_PT_panel,
+)
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.bone_chain_tool_props = bpy.props.PointerProperty(type=BoneChainToolProperties)
+
+def unregister():
+    del bpy.types.Scene.bone_chain_tool_props
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+if __name__ == "__main__":
+    register()
