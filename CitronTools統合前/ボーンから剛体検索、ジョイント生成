@@ -1,0 +1,482 @@
+bl_info = {
+    "name": "Skirt Root Table Builder",
+    "author": "DEEP CRIMSON, Chat Companion",
+    "version": (1, 6, 3), # Version updated
+    "blender": (3, 6, 0),
+    "category": "Rigging",
+    "description": "Builds a table from skirt root bones to manage and select bones/rigids, and create joints.",
+}
+
+import bpy
+from bpy.types import Panel, Operator, PropertyGroup, UIList
+from bpy.props import (
+    StringProperty, CollectionProperty, IntProperty, BoolProperty, EnumProperty, PointerProperty
+)
+
+# -------------------------
+# Data Structures
+# -------------------------
+
+class SkirtToolSettings(PropertyGroup):
+    """アドオン全体の設定を保持するプロパティグループ"""
+    loop_joints: BoolProperty(
+        name="Loop Joints",
+        description="Connect the last rigid body to the first one in a row/column",
+        default=False
+    )
+
+class SkirtRootItem(PropertyGroup):
+    bone_name: StringProperty(name="Bone Name")
+
+class SkirtTableCell(PropertyGroup):
+    bone_name: StringProperty(name="Bone Name")
+    row: IntProperty()
+    col: IntProperty()
+    
+class SkirtRigidMapItem(PropertyGroup):
+    bone_name: StringProperty()
+    rigid_name: StringProperty()
+
+# -------------------------
+# Utility Functions
+# -------------------------
+
+def get_chain_linear(root_bone):
+    chain = [root_bone]
+    current = root_bone
+    while current and current.children:
+        current = current.children[0]
+        chain.append(current)
+    return chain
+
+def get_rigid_name_by_bone(scene, bone_name):
+    for item in scene.skirt_rigid_map:
+        if item.bone_name == bone_name:
+            return item.rigid_name
+    return None
+
+def build_rigid_map(context):
+    rigid_map = {}
+    rigids = [obj for obj in context.scene.objects if hasattr(obj, "mmd_rigid") and obj.mmd_rigid.type != 'NONE']
+    for obj in rigids:
+        bone_name = obj.mmd_rigid.bone
+        if bone_name:
+            rigid_map.setdefault(bone_name, []).append(obj)
+    return rigid_map
+
+# -------------------------
+# Operators
+# -------------------------
+
+class SKIRT_OT_add_root_from_selection(Operator):
+    bl_idname = "skirt.add_root_from_selection"
+    bl_label = "Add Roots From Selection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'WARNING'}, "Select an Armature object.")
+            return {'CANCELLED'}
+        scene = context.scene
+        scene.skirt_root_order.clear()
+        for bone in context.selected_pose_bones:
+            item = scene.skirt_root_order.add()
+            item.bone_name = bone.name
+        scene.skirt_root_index = 0
+        return {'FINISHED'}
+
+class SKIRT_OT_move_root(Operator):
+    bl_idname = "skirt.move_root"
+    bl_label = "Move Root"
+    direction: StringProperty()
+
+    def execute(self, context):
+        scene = context.scene
+        idx, lst = scene.skirt_root_index, scene.skirt_root_order
+        if self.direction == 'UP' and idx > 0:
+            lst.move(idx, idx - 1)
+            scene.skirt_root_index -= 1
+        elif self.direction == 'DOWN' and idx < len(lst) - 1:
+            lst.move(idx, idx + 1)
+            scene.skirt_root_index += 1
+        return {'FINISHED'}
+
+class SKIRT_OT_build_table(Operator):
+    bl_idname = "skirt.build_table"
+    bl_label = "Build Table"
+
+    def execute(self, context):
+        scene = context.scene
+        scene.skirt_table.clear()
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'WARNING'}, "Select an Armature object.")
+            return {'CANCELLED'}
+        roots = [item.bone_name for item in scene.skirt_root_order]
+        for col, root_name in enumerate(roots):
+            root = arm.data.bones.get(root_name)
+            if not root: continue
+            chain = get_chain_linear(root)
+            for row, bone in enumerate(chain):
+                cell = scene.skirt_table.add()
+                cell.bone_name = bone.name
+                cell.row = row
+                cell.col = col
+        return {'FINISHED'}
+
+class SKIRT_OT_scan_rigids(Operator):
+    bl_idname = "skirt.scan_rigids"
+    bl_label = "Scan Rigids"
+
+    def execute(self, context):
+        scene = context.scene
+        scene.skirt_rigid_map.clear()
+        rigid_map = build_rigid_map(context)
+        count = 0
+        for bone_name, rigids in rigid_map.items():
+            for rigid in rigids:
+                item = scene.skirt_rigid_map.add()
+                item.bone_name = bone_name
+                item.rigid_name = rigid.name
+                count += 1
+        self.report({'INFO'}, f"Found {count} MMD rigid bodies.")
+        return {'FINISHED'}
+
+# --- Base Class for selection ---
+class SKIRT_OT_select_cell_base(Operator):
+    """Base class for selection ops to handle mouse events."""
+    def invoke(self, context, event):
+        self.use_deselect = not event.shift and not event.ctrl
+        self.use_toggle = event.ctrl or event.alt
+        return self.execute(context)
+
+# --- CORRECTED CLASS DEFINITIONS ---
+class SKIRT_OT_select_cell(SKIRT_OT_select_cell_base):
+    bl_idname = "skirt.select_cell"
+    bl_label = "Select Cell"
+    bone_name: StringProperty()
+
+    def execute(self, context):
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE': return {'CANCELLED'}
+        bpy.ops.object.mode_set(mode='POSE')
+        if self.use_deselect:
+            bpy.ops.pose.select_all(action='DESELECT')
+        pb = arm.pose.bones.get(self.bone_name)
+        if pb:
+            pb.bone.select = not pb.bone.select if self.use_toggle else True
+            arm.data.bones.active = pb.bone
+        return {'FINISHED'}
+
+class SKIRT_OT_select_row(SKIRT_OT_select_cell_base):
+    bl_idname = "skirt.select_row"
+    bl_label = "Select Row"
+    row: IntProperty()
+
+    def execute(self, context):
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE': return {'CANCELLED'}
+        bpy.ops.object.mode_set(mode='POSE')
+        if self.use_deselect:
+            bpy.ops.pose.select_all(action='DESELECT')
+        bone_names = [c.bone_name for c in context.scene.skirt_table if c.row == self.row]
+        for name in bone_names:
+            pb = arm.pose.bones.get(name)
+            if pb:
+                pb.bone.select = not pb.bone.select if self.use_toggle else True
+        return {'FINISHED'}
+
+class SKIRT_OT_select_col(SKIRT_OT_select_cell_base):
+    bl_idname = "skirt.select_col"
+    bl_label = "Select Column"
+    col: IntProperty()
+
+    def execute(self, context):
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE': return {'CANCELLED'}
+        bpy.ops.object.mode_set(mode='POSE')
+        if self.use_deselect:
+            bpy.ops.pose.select_all(action='DESELECT')
+        bone_names = [c.bone_name for c in context.scene.skirt_table if c.col == self.col]
+        for name in bone_names:
+            pb = arm.pose.bones.get(name)
+            if pb:
+                pb.bone.select = not pb.bone.select if self.use_toggle else True
+        return {'FINISHED'}
+
+class SKIRT_OT_select_rigid_cell(SKIRT_OT_select_cell_base):
+    bl_idname = "skirt.select_rigid_cell"
+    bl_label = "Select Rigid Body"
+    bone_name: StringProperty()
+
+    def execute(self, context):
+        rigid_name = get_rigid_name_by_bone(context.scene, self.bone_name)
+        if rigid_name:
+            rigid_obj = bpy.data.objects.get(rigid_name)
+            if rigid_obj:
+                if self.use_deselect:
+                    bpy.ops.object.select_all(action='DESELECT')
+                rigid_obj.select_set(not rigid_obj.select_get() if self.use_toggle else True)
+                context.view_layer.objects.active = rigid_obj
+        return {'FINISHED'}
+
+class SKIRT_OT_select_rigid_row(SKIRT_OT_select_cell_base):
+    bl_idname = "skirt.select_rigid_row"
+    bl_label = "Select Rigid Row"
+    row: IntProperty()
+
+    def execute(self, context):
+        if self.use_deselect:
+            bpy.ops.object.select_all(action='DESELECT')
+        target_names = [get_rigid_name_by_bone(context.scene, cell.bone_name) for cell in context.scene.skirt_table if cell.row == self.row]
+        for name in target_names:
+            obj = bpy.data.objects.get(name)
+            if obj:
+                obj.select_set(not obj.select_get() if self.use_toggle else True)
+        return {'FINISHED'}
+
+class SKIRT_OT_select_rigid_col(SKIRT_OT_select_cell_base):
+    bl_idname = "skirt.select_rigid_col"
+    bl_label = "Select Rigid Column"
+    col: IntProperty()
+
+    def execute(self, context):
+        if self.use_deselect:
+            bpy.ops.object.select_all(action='DESELECT')
+        target_names = [get_rigid_name_by_bone(context.scene, cell.bone_name) for cell in context.scene.skirt_table if cell.col == self.col]
+        for name in target_names:
+            obj = bpy.data.objects.get(name)
+            if obj:
+                obj.select_set(not obj.select_get() if self.use_toggle else True)
+        return {'FINISHED'}
+
+# --- Joint Creation ---
+def create_and_rename_joint(context, obj1, obj2, prefix=""):
+    if not hasattr(bpy.ops.mmd_tools, 'joint_add'):
+        return None, "mmd_tools addon 'joint_add' not found."
+    bpy.ops.object.select_all(action='DESELECT')
+    obj1.select_set(True)
+    obj2.select_set(True)
+    context.view_layer.objects.active = obj2
+    bpy.ops.mmd_tools.joint_add()
+    new_joint = context.active_object
+    if new_joint:
+        new_joint.name = f"{prefix}{obj1.name}-{obj2.name}"
+        return new_joint, None
+    return None, "Joint creation failed."
+
+class SKIRT_OT_create_joints(Operator):
+    bl_idname = "skirt.create_joints"
+    bl_label = "Create Joints for Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+    direction: EnumProperty(items=[('HORIZONTAL', "Horizontal", ""), ('VERTICAL', "Vertical", "")], name="Direction")
+
+    def execute(self, context):
+        scene, settings = context.scene, context.scene.skirt_tool_settings
+        original_selection = [obj for obj in context.selected_objects if obj]
+        selected_rigids = [obj for obj in original_selection if hasattr(obj, 'mmd_rigid') and obj.mmd_rigid.type != 'NONE']
+        
+        if len(selected_rigids) < 2:
+            self.report({'WARNING'}, "Select at least 2 rigid bodies")
+            return {'CANCELLED'}
+
+        bone_to_cell = {(c.bone_name): (c.row, c.col) for c in scene.skirt_table}
+        rigid_to_cell = {item.rigid_name: bone_to_cell[item.bone_name] for item in scene.skirt_rigid_map if item.bone_name in bone_to_cell}
+
+        groups = {}
+        for rigid in selected_rigids:
+            if rigid.name not in rigid_to_cell: continue
+            row_idx, col_idx = rigid_to_cell[rigid.name]
+            key = row_idx if self.direction == 'HORIZONTAL' else col_idx
+            if key not in groups: groups[key] = []
+            groups[key].append(rigid)
+
+        created_count = 0
+        for rigids_in_group in groups.values():
+            if len(rigids_in_group) < 2: continue
+            sort_idx = 1 if self.direction == 'HORIZONTAL' else 0
+            sorted_rigids = sorted(rigids_in_group, key=lambda r: rigid_to_cell.get(r.name, (999, 999))[sort_idx])
+            
+            pairs = [(sorted_rigids[i], sorted_rigids[i + 1]) for i in range(len(sorted_rigids) - 1)]
+            if settings.loop_joints: pairs.append((sorted_rigids[-1], sorted_rigids[0]))
+                
+            prefix = "J.LAT_" if self.direction == 'HORIZONTAL' else "J."
+            for o1, o2 in pairs:
+                _, err = create_and_rename_joint(context, o1, o2, prefix)
+                if err: self.report({'ERROR'}, err); return {'CANCELLED'}
+                created_count += 1
+        
+        self.report({'INFO'}, f"Created {created_count} joints for selection")
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in original_selection: obj.select_set(True)
+        return {'FINISHED'}
+
+class SKIRT_OT_create_table_joints(Operator):
+    bl_idname = "skirt.create_table_joints"
+    bl_label = "Create Joints for Table"
+    bl_options = {'REGISTER', 'UNDO'}
+    direction: EnumProperty(items=[('HORIZONTAL', "Horizontal", ""), ('VERTICAL', "Vertical", "")], name="Direction")
+
+    def execute(self, context):
+        scene, settings = context.scene, context.scene.skirt_tool_settings
+        if not scene.skirt_table or not scene.skirt_rigid_map:
+            self.report({'WARNING'}, "Build table and Scan rigids first"); return {'CANCELLED'}
+
+        bone_to_cell = {(c.bone_name):(c.row,c.col) for c in scene.skirt_table}
+        rigid_to_cell = {item.rigid_name: bone_to_cell[item.bone_name] for item in scene.skirt_rigid_map if item.bone_name in bone_to_cell}
+        all_rigids = [bpy.data.objects.get(r.rigid_name) for r in scene.skirt_rigid_map if r.rigid_name in rigid_to_cell]
+        all_rigids = [r for r in all_rigids if r]
+
+        groups = {}
+        for rigid in all_rigids:
+            row_idx, col_idx = rigid_to_cell[rigid.name]
+            key = row_idx if self.direction == 'HORIZONTAL' else col_idx
+            if key not in groups: groups[key] = []
+            groups[key].append(rigid)
+
+        created_count = 0
+        for rigids_in_group in groups.values():
+            if len(rigids_in_group) < 2: continue
+            sort_idx = 1 if self.direction == 'HORIZONTAL' else 0
+            sorted_rigids = sorted(rigids_in_group, key=lambda r: rigid_to_cell.get(r.name, (999, 999))[sort_idx])
+            
+            pairs = [(sorted_rigids[i], sorted_rigids[i+1]) for i in range(len(sorted_rigids)-1)]
+            if settings.loop_joints: pairs.append((sorted_rigids[-1], sorted_rigids[0]))
+                
+            prefix = "J.LAT_" if self.direction == 'HORIZONTAL' else "J."
+            for o1, o2 in pairs:
+                _, err = create_and_rename_joint(context, o1, o2, prefix)
+                if err: self.report({'ERROR'}, err); return {'CANCELLED'}
+                created_count += 1
+                
+        self.report({'INFO'}, f"Created {created_count} joints for the entire table")
+        bpy.ops.object.select_all(action='DESELECT')
+        return {'FINISHED'}
+        
+# -------------------------
+# UI
+# -------------------------
+class SKIRT_UL_root_list(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        layout.prop(item, "bone_name", text="", emboss=False)
+
+class SKIRT_PT_main(Panel):
+    bl_label = "Skirt Tools"
+    bl_idname = "SKIRT_PT_main"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Skirt"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        
+        box = layout.box()
+        box.label(text="1. Bone Setup")
+        box.operator("skirt.add_root_from_selection", icon='BONE_DATA')
+        row = box.row()
+        row.template_list("SKIRT_UL_root_list", "", scene, "skirt_root_order", scene, "skirt_root_index")
+        col = row.column(align=True)
+        col.operator("skirt.move_root", text="", icon='TRIA_UP').direction = 'UP'
+        col.operator("skirt.move_root", text="", icon='TRIA_DOWN').direction = 'DOWN'
+        box.operator("skirt.build_table", icon='PREFERENCES')
+        if not scene.skirt_table: return
+
+        max_row = max((c.row for c in scene.skirt_table), default=-1) + 1
+        max_col = max((c.col for c in scene.skirt_table), default=-1) + 1
+        cell_map = {(c.row, c.col): c for c in scene.skirt_table}
+
+        box = layout.box()
+        box.label(text="Bone Table")
+        header = box.row(align=True); header.label(text="")
+        for c in range(max_col):
+            op = header.operator("skirt.select_col", text=f"C{c}"); op.col = c
+        for r in range(max_row):
+            row_ui = box.row(align=True)
+            op = row_ui.operator("skirt.select_row", text=f"{r:03}"); op.row = r
+            for c in range(max_col):
+                if cell := cell_map.get((r, c)):
+                    op = row_ui.operator("skirt.select_cell", text=cell.bone_name); op.bone_name = cell.bone_name
+                else: row_ui.label(text="")
+
+        box = layout.box()
+        sub_row = box.row()
+        sub_row.label(text="2. Rigid Body Tools")
+        sub_row.operator("skirt.scan_rigids", text="", icon='FILE_REFRESH')
+        if not scene.skirt_rigid_map: return
+        
+        box.label(text="Rigid Body Table")
+        header = box.row(align=True); header.label(text="")
+        for c in range(max_col):
+            op = header.operator("skirt.select_rigid_col", text=f"C{c}"); op.col = c
+        for r in range(max_row):
+            row_ui = box.row(align=True)
+            op = row_ui.operator("skirt.select_rigid_row", text=f"{r:03}"); op.row = r
+            for c in range(max_col):
+                if cell := cell_map.get((r, c)):
+                    if rn := get_rigid_name_by_bone(scene, cell.bone_name):
+                        op = row_ui.operator("skirt.select_rigid_cell", text=rn); op.bone_name = cell.bone_name
+                    else: row_ui.label(text="-")
+                else: row_ui.label(text="-")
+
+        layout.separator()
+        main_box = layout.box()
+        main_box.label(text="3. Joint Tools")
+        settings = scene.skirt_tool_settings
+        main_box.prop(settings, "loop_joints")
+        
+        box = main_box.box()
+        box.label(text="For Selected Rigids:")
+        row = box.row(align=True)
+        op_h = row.operator("skirt.create_joints", text="Horizontal", icon='ARROW_LEFTRIGHT')
+        op_h.direction = 'HORIZONTAL'
+        # --- ERROR CORRECTED HERE ---
+        op_v = row.operator("skirt.create_joints", text="Vertical", icon='CON_ROTLIKE')
+        op_v.direction = 'VERTICAL'
+
+        box = main_box.box()
+        box.label(text="For Entire Table:")
+        row = box.row(align=True)
+        op_h_all = row.operator("skirt.create_table_joints", text="All Horizontal", icon='CON_TRANSLIKE')
+        op_h_all.direction = 'HORIZONTAL'
+        op_v_all = row.operator("skirt.create_table_joints", text="All Vertical", icon='CON_ROTLIKE') # ← 修正後
+        op_v_all.direction = 'VERTICAL'
+
+# -------------------------
+# Registration
+# -------------------------
+classes = (
+    SkirtToolSettings, SkirtRootItem, SkirtTableCell, SkirtRigidMapItem,
+    SKIRT_OT_add_root_from_selection, SKIRT_OT_move_root, SKIRT_OT_build_table, SKIRT_OT_scan_rigids,
+    SKIRT_OT_select_cell, SKIRT_OT_select_row, SKIRT_OT_select_col,
+    SKIRT_OT_select_rigid_cell, SKIRT_OT_select_rigid_row, SKIRT_OT_select_rigid_col,
+    SKIRT_OT_create_joints, SKIRT_OT_create_table_joints,
+    SKIRT_UL_root_list, SKIRT_PT_main,
+)
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.skirt_tool_settings = PointerProperty(type=SkirtToolSettings)
+    bpy.types.Scene.skirt_root_order = CollectionProperty(type=SkirtRootItem)
+    bpy.types.Scene.skirt_root_index = IntProperty()
+    bpy.types.Scene.skirt_table = CollectionProperty(type=SkirtTableCell)
+    bpy.types.Scene.skirt_rigid_map = CollectionProperty(type=SkirtRigidMapItem)
+
+def unregister():
+    props_to_del = [ "skirt_tool_settings", "skirt_root_order", "skirt_root_index", "skirt_table", "skirt_rigid_map" ]
+    for prop in props_to_del:
+        if hasattr(bpy.types.Scene, prop):
+            delattr(bpy.types.Scene, prop)
+
+    for cls in reversed(classes):
+        if hasattr(bpy.types, cls.__name__):
+            bpy.utils.unregister_class(cls)
+
+if __name__ == "__main__":
+    try:
+        unregister()
+    except Exception:
+        pass
+    register()
