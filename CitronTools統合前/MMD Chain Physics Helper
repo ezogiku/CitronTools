@@ -1,0 +1,1372 @@
+bl_info = {
+    "name": "MMD Chain Physics Helper",
+    "author": "DEEP CRIMSON, Chat Companion",
+    "version": (4, 1, 2),
+    "blender": (4, 0, 0),
+    "category": "MMD",
+    "description": "Manage MMD physics chains. Auto-Symmetrize creates Sets/Bones only.",
+}
+
+import bpy
+from bpy.types import Panel, Operator, PropertyGroup, UIList
+from bpy.props import (
+    StringProperty, CollectionProperty, IntProperty, BoolProperty, EnumProperty, PointerProperty, FloatVectorProperty
+)
+from collections import defaultdict
+import mathutils
+import re
+
+# -------------------------
+# Data Structures
+# -------------------------
+class PhysicsRootItem(PropertyGroup):
+    bone_name: StringProperty(name="Bone Name")
+
+class PhysicsSet(PropertyGroup):
+    name: StringProperty(name="Set Name", default="New Set")
+    root_bones: CollectionProperty(type=PhysicsRootItem)
+    active_root_index: IntProperty()
+    parent_bone_name: StringProperty(name="Parent Bone", description="The bone that acts as the anchor for the roots")
+    
+    show_in_viewport: BoolProperty(name="Show in Viewport", default=True, description="Toggle viewport visibility")
+    is_selectable: BoolProperty(name="Is Selectable", default=True, description="Toggle selectability")
+
+class SkirtTableCell(PropertyGroup):
+    bone_name: StringProperty()
+    row: IntProperty()
+    col: IntProperty()
+
+class SkirtRigidMapItem(PropertyGroup):
+    bone_name: StringProperty()
+    rigid_name: StringProperty()
+
+class RigidCopySettings(PropertyGroup):
+    copy_type: BoolProperty(name="Type", default=True)
+    copy_shape: BoolProperty(name="Shape", default=True)
+    copy_size: BoolProperty(name="Size", default=True)
+    copy_mass: BoolProperty(name="Mass", default=True)
+    copy_friction: BoolProperty(name="Friction", default=True)
+    copy_restitution: BoolProperty(name="Restitution", default=True)
+    copy_collision_group: BoolProperty(name="Collision Group", default=True)
+    copy_collision_mask: BoolProperty(name="Collision Mask", default=True)
+
+class JointCopySettings(PropertyGroup):
+    copy_limits_linear: BoolProperty(name="Limits (Linear)", default=True)
+    copy_limits_angular: BoolProperty(name="Limits (Angular)", default=True)
+    copy_springs_linear: BoolProperty(name="Springs (Linear)", default=True)
+    copy_springs_angular: BoolProperty(name="Springs (Angular)", default=True)
+
+class GlobalPhysicsSettings(PropertyGroup):
+    loop_joints: BoolProperty(name="Loop Joints", default=False)
+    active_physics_set_index: IntProperty()
+    rigid_copy_settings: PointerProperty(type=RigidCopySettings)
+    joint_copy_settings: PointerProperty(type=JointCopySettings)
+
+# -------------------------
+# Utility Functions
+# -------------------------
+def get_active_set(context):
+    s = context.scene
+    sets = s.physics_tool_settings
+    if s.physics_sets and 0 <= sets.active_physics_set_index < len(s.physics_sets):
+        return s.physics_sets[sets.active_physics_set_index]
+    return None
+
+def get_related_objects_and_bones(context, physics_set):
+    arm = context.object
+    if not arm or arm.type != 'ARMATURE' or not physics_set: 
+        return {'bones': set(), 'rigids': set(), 'joints': set()}
+    
+    all_bone_names = {b.name for r in physics_set.root_bones if (rb:=arm.data.bones.get(r.bone_name)) for b in get_chain_linear(rb)}
+    
+    if physics_set.parent_bone_name and arm.data.bones.get(physics_set.parent_bone_name):
+        all_bone_names.add(physics_set.parent_bone_name)
+
+    all_rigids = {o for i in context.scene.skirt_rigid_map if i.bone_name in all_bone_names and (o:=bpy.data.objects.get(i.rigid_name))}
+    
+    if physics_set.parent_bone_name:
+        for obj in context.scene.objects:
+             if hasattr(obj, "mmd_rigid") and obj.mmd_rigid.bone == physics_set.parent_bone_name:
+                 all_rigids.add(obj)
+
+    all_rigid_names = {r.name for r in all_rigids}
+   
+    all_joints = set()
+    for obj in context.scene.objects:
+        if hasattr(obj, 'mmd_joint') and hasattr(obj, 'rigid_body_constraint') and obj.rigid_body_constraint:
+            c = obj.rigid_body_constraint
+            if (c.object1 and c.object1.name in all_rigid_names) or (c.object2 and c.object2.name in all_rigid_names):
+                all_joints.add(obj)
+                
+    return {'bones': all_bone_names, 'rigids': all_rigids, 'joints': all_joints}
+
+def get_chain_linear(root_bone):
+    chain = [root_bone]
+    current = root_bone
+    while current and current.children: 
+        current = current.children[0]
+        chain.append(current)
+    return chain
+
+def get_rigid_name_by_bone(scene, bone_name):
+    for item in scene.skirt_rigid_map:
+        if item.bone_name == bone_name: return item.rigid_name
+    for obj in scene.objects:
+        if hasattr(obj, "mmd_rigid") and obj.mmd_rigid.bone == bone_name:
+            return obj.name
+    return None
+
+def build_joint_display_maps(context):
+    s = context.scene
+    l_d, v_d, l_j, v_j = {}, {}, {}, {}
+    if not s.skirt_table: return l_d, v_d, l_j, v_j
+    
+    b2c = {(c.bone_name): (c.row, c.col) for c in s.skirt_table}
+    r2c = {i.rigid_name: b2c[i.bone_name] for i in s.skirt_rigid_map if i.bone_name in b2c}
+    
+    for j in (o for o in s.objects if hasattr(o, 'mmd_joint')):
+        if hasattr(j, 'rigid_body_constraint') and j.rigid_body_constraint and \
+           (o1:=j.rigid_body_constraint.object1) and (o2:=j.rigid_body_constraint.object2):
+            if (tc := r2c.get(o2.name)):
+                if j.name.startswith("J.LAT_"): 
+                    l_d[tc] = o1.name
+                    l_j[tc] = j
+                else: 
+                    v_d[tc] = o1.name
+                    v_j[tc] = j
+    return l_d, v_d, l_j, v_j
+
+def set_set_visibility(context, physics_set, is_visible):
+    arm = context.object
+    related = get_related_objects_and_bones(context, physics_set)
+    hide_value = not is_visible
+    original_mode = arm.mode if arm and arm.mode != 'OBJECT' else None
+    if bpy.context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+    
+    for obj in related['rigids'] | related['joints']: 
+        obj.hide_viewport = hide_value
+        obj.hide_render = hide_value
+        
+    if arm and related['bones']:
+        bpy.context.view_layer.objects.active = arm
+        bpy.ops.object.mode_set(mode='POSE')
+        for bone_name in related['bones']:
+            if p_bone := arm.pose.bones.get(bone_name): p_bone.bone.hide = hide_value
+    if original_mode: bpy.ops.object.mode_set(mode=original_mode)
+        
+def set_set_selectability(context, physics_set, is_selectable):
+    arm = context.object
+    related = get_related_objects_and_bones(context, physics_set)
+    hide_select_value = not is_selectable
+    original_mode = arm.mode if arm and arm.mode != 'OBJECT' else None
+    if bpy.context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+    
+    for obj in related['rigids'] | related['joints']: 
+        obj.hide_select = hide_select_value
+        
+    if arm and related['bones']:
+        for bone_name in related['bones']:
+            if bone := arm.data.bones.get(bone_name): bone.hide_select = hide_select_value
+    if original_mode: bpy.ops.object.mode_set(mode=original_mode)
+
+def get_mirror_name(name):
+    patterns = [
+        ('.L', '.R'), ('.R', '.L'),
+        ('_L', '_R'), ('_R', '_L'),
+        ('.l', '.r'), ('.r', '.l'),
+        ('_l', '_r'), ('_r', '_l'),
+        ('Left', 'Right'), ('Right', 'Left'),
+    ]
+    for left, right in patterns:
+        if left in name:
+            placeholder = "___MIRROR_TEMP___"
+            new_name = name.replace(left, placeholder)
+            new_name = new_name.replace(right, left)
+            new_name = new_name.replace(placeholder, right)
+            if new_name != name:
+                return new_name
+    if name.endswith("L"): return name[:-1] + "R"
+    if name.endswith("R"): return name[:-1] + "L"
+    return None
+
+def get_mirror_japanese_name(name):
+    if "左" in name: return name.replace("左", "右")
+    if "右" in name: return name.replace("右", "左")
+    return name
+
+def ensure_object_selectable(obj):
+    """Ensure the object is visible and selectable."""
+    if obj:
+        obj.hide_viewport = False
+        obj.hide_set(False)
+        for col in obj.users_collection:
+            col.hide_viewport = False
+
+def is_valid_rigid(obj):
+    """Check if object is a valid MMD rigid body"""
+    return obj and hasattr(obj, 'mmd_rigid') and obj.mmd_rigid.type != 'NONE'
+
+def ensure_symmetric_bones(context, active_set):
+    """
+    Ensure symmetric bones exist for the active set.
+    """
+    arm = context.object
+    if not arm or arm.type != 'ARMATURE': return
+
+    src_bone_names = set()
+    if active_set.parent_bone_name:
+        src_bone_names.add(active_set.parent_bone_name)
+    
+    for item in active_set.root_bones:
+        if rb := arm.data.bones.get(item.bone_name):
+            for b in get_chain_linear(rb):
+                src_bone_names.add(b.name)
+    
+    bones_to_symmetrize = []
+    for name in src_bone_names:
+        tgt_name = get_mirror_name(name)
+        if tgt_name and arm.data.bones.get(tgt_name) is None:
+            bones_to_symmetrize.append(name)
+    
+    if not bones_to_symmetrize:
+        return 
+
+    # Save original mode to restore later
+    original_mode = arm.mode
+    
+    # Enter Edit Mode
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.armature.select_all(action='DESELECT')
+    
+    ebones = arm.data.edit_bones
+    count = 0
+    for name in bones_to_symmetrize:
+        if eb := ebones.get(name):
+            eb.select = True
+            eb.select_head = True
+            eb.select_tail = True
+            count += 1
+            
+    if count > 0:
+        bpy.ops.armature.symmetrize(direction='NEGATIVE_X') 
+    
+    # Switch to Pose Mode for MMD props
+    bpy.ops.object.mode_set(mode='POSE')
+    
+    for src_name in bones_to_symmetrize:
+        tgt_name = get_mirror_name(src_name)
+        src_pbone = arm.pose.bones.get(src_name)
+        tgt_pbone = arm.pose.bones.get(tgt_name)
+        
+        if src_pbone and tgt_pbone and hasattr(src_pbone, 'mmd_bone') and hasattr(tgt_pbone, 'mmd_bone'):
+            if src_pbone.mmd_bone.name_e:
+                tgt_pbone.mmd_bone.name_e = get_mirror_name(src_pbone.mmd_bone.name_e)
+            if src_pbone.mmd_bone.name_j:
+                tgt_pbone.mmd_bone.name_j = get_mirror_japanese_name(src_pbone.mmd_bone.name_j)
+
+    # Restore original mode
+    bpy.ops.object.mode_set(mode=original_mode)
+
+def copy_rigid_params_core(src_rigid, tgt_rigid):
+    rigid_props = ['type', 'shape', 'collision_group_number']
+    for prop in rigid_props: 
+        if hasattr(src_rigid.mmd_rigid, prop):
+            setattr(tgt_rigid.mmd_rigid, prop, getattr(src_rigid.mmd_rigid, prop))
+    
+    for i in range(16):
+        tgt_rigid.mmd_rigid.collision_group_mask[i] = src_rigid.mmd_rigid.collision_group_mask[i]
+
+    tgt_rigid.mmd_rigid.size = src_rigid.mmd_rigid.size
+    
+    if src_rigid.rigid_body and tgt_rigid.rigid_body:
+        rb_src = src_rigid.rigid_body
+        rb_tgt = tgt_rigid.rigid_body
+        rb_tgt.mass = rb_src.mass
+        rb_tgt.friction = rb_src.friction
+        rb_tgt.restitution = rb_src.restitution
+        rb_tgt.linear_damping = rb_src.linear_damping
+        rb_tgt.angular_damping = rb_src.angular_damping
+        rb_tgt.use_margin = rb_src.use_margin
+        rb_tgt.collision_margin = rb_src.collision_margin
+
+    mat = mathutils.Matrix.Scale(-1, 4, (1,0,0)) @ src_rigid.matrix_world
+    loc, rot, _ = mat.decompose()
+    tgt_rigid.matrix_world = mathutils.Matrix.Translation(loc) @ rot.to_matrix().to_4x4() @ mathutils.Matrix.Scale(src_rigid.scale[0], 4)
+
+def copy_joint_params_core(src_joint, tgt_joint):
+    joint_props = ['spring_linear', 'spring_angular']
+    mmd_limit_props = ['limit_move_min', 'limit_move_max', 'limit_angle_min', 'limit_angle_max']
+    
+    all_joint_props = joint_props + mmd_limit_props
+    for prop in all_joint_props: 
+        if hasattr(src_joint.mmd_joint, prop):
+            setattr(tgt_joint.mmd_joint, prop, getattr(src_joint.mmd_joint, prop))
+    
+    mat = mathutils.Matrix.Scale(-1, 4, (1,0,0)) @ src_joint.matrix_world
+    loc, rot, _ = mat.decompose()
+    tgt_joint.matrix_world = mathutils.Matrix.Translation(loc) @ rot.to_matrix().to_4x4() @ mathutils.Matrix.Scale(src_joint.scale[0], 4)
+    
+    if src_joint.rigid_body_constraint and tgt_joint.rigid_body_constraint:
+        src_c, tgt_c = src_joint.rigid_body_constraint, tgt_joint.rigid_body_constraint
+        
+        tgt_c.use_limit_lin_x = src_c.use_limit_lin_x
+        tgt_c.use_limit_lin_y = src_c.use_limit_lin_y
+        tgt_c.use_limit_lin_z = src_c.use_limit_lin_z
+        tgt_c.use_limit_ang_x = src_c.use_limit_ang_x
+        tgt_c.use_limit_ang_y = src_c.use_limit_ang_y
+        tgt_c.use_limit_ang_z = src_c.use_limit_ang_z
+
+        tgt_c.limit_lin_x_lower = src_c.limit_lin_x_lower; tgt_c.limit_lin_x_upper = src_c.limit_lin_x_upper
+        tgt_c.limit_lin_y_lower = src_c.limit_lin_y_lower; tgt_c.limit_lin_y_upper = src_c.limit_lin_y_upper
+        tgt_c.limit_lin_z_lower = src_c.limit_lin_z_lower; tgt_c.limit_lin_z_upper = src_c.limit_lin_z_upper
+        
+        tgt_c.limit_ang_x_lower = src_c.limit_ang_x_lower; tgt_c.limit_ang_x_upper = src_c.limit_ang_x_upper
+        tgt_c.limit_ang_y_lower = src_c.limit_ang_y_lower; tgt_c.limit_ang_y_upper = src_c.limit_ang_y_upper
+        tgt_c.limit_ang_z_lower = src_c.limit_ang_z_lower; tgt_c.limit_ang_z_upper = src_c.limit_ang_z_upper
+
+def create_and_rename_joint(context, obj1, obj2, prefix=""):
+    if not hasattr(bpy.ops.mmd_tools, 'joint_add'): return None, "mmd_tools not found."
+    
+    ensure_object_selectable(obj1)
+    ensure_object_selectable(obj2)
+    
+    if context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.ops.object.select_all(action='DESELECT')
+    
+    obj1.select_set(True)
+    obj2.select_set(True)
+    context.view_layer.objects.active = obj2
+    
+    bpy.ops.mmd_tools.joint_add()
+    j = context.active_object
+    if not j: return None, "Joint creation failed."
+    
+    ensure_object_selectable(j)
+    
+    if j.rigid_body_constraint:
+        j.rigid_body_constraint.object1 = obj1
+        j.rigid_body_constraint.object2 = obj2
+
+    j.name = f"{prefix}{obj1.name}-{obj2.name}"
+    if hasattr(j, 'mmd_joint'): 
+        b = f"{obj1.name}-{obj2.name}"
+        m = f"LAT_{b}" if "LAT" in prefix else b
+        j.mmd_joint.name_j = m
+        j.mmd_joint.name_e = m
+    return j, None
+
+# -------------------------
+# Operators
+# -------------------------
+class PHYSICS_OT_add_set(Operator):
+    bl_idname = "physics.add_set"
+    bl_label = "Add Physics Set"
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context): 
+        new_set = context.scene.physics_sets.add()
+        context.scene.physics_tool_settings.active_physics_set_index = len(context.scene.physics_sets)-1
+        return {'FINISHED'}
+
+class PHYSICS_OT_remove_set(Operator):
+    bl_idname = "physics.remove_set"
+    bl_label = "Remove Set"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, context): return get_active_set(context) is not None
+    def execute(self, context): 
+        settings = context.scene.physics_tool_settings
+        index = settings.active_physics_set_index
+        context.scene.physics_sets.remove(index)
+        settings.active_physics_set_index = min(index, len(context.scene.physics_sets)-1)
+        return {'FINISHED'}
+
+class PHYSICS_OT_move_set(Operator):
+    bl_idname = "physics.move_set"
+    bl_label = "Move Set"
+    direction: StringProperty()
+    @classmethod
+    def poll(cls, context): return get_active_set(context) is not None
+    def execute(self, context):
+        settings = context.scene.physics_tool_settings
+        idx = settings.active_physics_set_index
+        if self.direction=='UP' and idx > 0: 
+            context.scene.physics_sets.move(idx, idx-1)
+            settings.active_physics_set_index -= 1
+        elif self.direction=='DOWN' and idx < len(context.scene.physics_sets)-1: 
+            context.scene.physics_sets.move(idx, idx+1)
+            settings.active_physics_set_index += 1
+        return {'FINISHED'}
+
+class PHYSICS_OT_set_parent_bone(Operator):
+    bl_idname = "physics.set_parent_bone"
+    bl_label = "Set Parent Bone"
+    bl_description = "Set the active pose bone as the Parent for this set"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        return get_active_set(context) and context.active_pose_bone
+        
+    def execute(self, context):
+        active_set = get_active_set(context)
+        active_set.parent_bone_name = context.active_pose_bone.name
+        return {'FINISHED'}
+
+class PHYSICS_OT_add_root_from_selection(Operator):
+    bl_idname = "physics.add_root_from_selection"
+    bl_label = "Set Roots From Selection"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, context): return get_active_set(context) is not None
+    def execute(self, context):
+        arm = context.object
+        active_set = get_active_set(context)
+        if not arm or arm.type != 'ARMATURE': 
+            self.report({'WARNING'}, "Select an Armature object.")
+            return {'CANCELLED'}
+        
+        bpy.ops.object.mode_set(mode='POSE')
+        active_set.root_bones.clear()
+        for bone in context.selected_pose_bones: 
+            item = active_set.root_bones.add()
+            item.bone_name = bone.name
+        active_set.active_root_index = 0
+        return {'FINISHED'}
+
+class PHYSICS_OT_move_root(Operator):
+    bl_idname = "physics.move_root"
+    bl_label = "Move Root"
+    direction: StringProperty()
+    @classmethod
+    def poll(cls, context): return get_active_set(context) is not None
+    def execute(self, context):
+        active_set = get_active_set(context)
+        idx = active_set.active_root_index
+        if self.direction=='UP' and idx > 0: 
+            active_set.root_bones.move(idx, idx-1)
+            active_set.active_root_index -= 1
+        elif self.direction=='DOWN' and idx < len(active_set.root_bones)-1: 
+            active_set.root_bones.move(idx, idx+1)
+            active_set.active_root_index += 1
+        return {'FINISHED'}
+
+class PHYSICS_OT_build_table(Operator):
+    bl_idname = "physics.build_table"
+    bl_label = "Rebuild Table"
+    @classmethod
+    def poll(cls, context): return get_active_set(context) is not None
+    def execute(self, context):
+        scene = context.scene
+        scene.skirt_table.clear()
+        arm = context.object
+        active_set = get_active_set(context)
+        if not arm or arm.type != 'ARMATURE': 
+            self.report({'WARNING'}, "Select an Armature object.")
+            return {'CANCELLED'}
+            
+        roots = [item.bone_name for item in active_set.root_bones]
+        for col, name in enumerate(roots):
+            if root := arm.data.bones.get(name):
+                for row, bone in enumerate(get_chain_linear(root)): 
+                    cell = scene.skirt_table.add()
+                    cell.bone_name = bone.name
+                    cell.row = row
+                    cell.col = col
+                    
+        bpy.ops.physics.scan_rigids('INVOKE_DEFAULT')
+        self.report({'INFO'}, "Table rebuilt and rigids rescanned.")
+        return {'FINISHED'}
+
+class PHYSICS_OT_scan_rigids(Operator):
+    bl_idname = "physics.scan_rigids"
+    bl_label = "Rescan Rigid Bodies"
+    def execute(self, context):
+        scene = context.scene
+        scene.skirt_rigid_map.clear()
+        count = 0
+        for obj in scene.objects:
+            if hasattr(obj, "mmd_rigid") and obj.mmd_rigid.type != 'NONE' and (bone_name := obj.mmd_rigid.bone):
+                item = scene.skirt_rigid_map.add()
+                item.bone_name = bone_name
+                item.rigid_name = obj.name
+                count += 1
+        self.report({'INFO'}, f"Mapped {count} rigid bodies.")
+        return {'FINISHED'}
+
+class PHYSICS_OT_toggle_visibility(Operator):
+    bl_idname = "physics.toggle_visibility"
+    bl_label = "Toggle Set Visibility"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, context): return get_active_set(context) is not None
+    def execute(self, context): 
+        active_set = get_active_set(context)
+        active_set.show_in_viewport = not active_set.show_in_viewport
+        set_set_visibility(context, active_set, active_set.show_in_viewport)
+        return {'FINISHED'}
+
+class PHYSICS_OT_toggle_selectability(Operator):
+    bl_idname = "physics.toggle_selectability"
+    bl_label = "Toggle Set Selectability"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, context): return get_active_set(context) is not None
+    def execute(self, context): 
+        active_set = get_active_set(context)
+        active_set.is_selectable = not active_set.is_selectable
+        set_set_selectability(context, active_set, active_set.is_selectable)
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_set_items(Operator):
+    bl_idname = "physics.select_set_items"
+    bl_label = "Select All Items in Set"
+    bl_options = {'REGISTER', 'UNDO'}
+    set_index: IntProperty()
+    def execute(self, context):
+        if self.set_index >= len(context.scene.physics_sets): return {'CANCELLED'}
+        p_set = context.scene.physics_sets[self.set_index]
+        arm = context.object
+        related = get_related_objects_and_bones(context, p_set)
+        
+        original_mode = arm.mode if arm and arm.mode != 'OBJECT' else None
+        if bpy.context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+        for obj in related['rigids'] | related['joints']: obj.select_set(True)
+        if arm and related['bones']:
+            bpy.context.view_layer.objects.active = arm
+            bpy.ops.object.mode_set(mode='POSE')
+            for name in related['bones']:
+                if p_bone := arm.pose.bones.get(name): p_bone.bone.select = True
+        if original_mode: bpy.ops.object.mode_set(mode=original_mode)
+        return {'FINISHED'}
+
+class PHYSICS_OT_deselect_set_items(Operator):
+    bl_idname = "physics.deselect_set_items"
+    bl_label = "Deselect All Items in Set"
+    bl_options = {'REGISTER', 'UNDO'}
+    set_index: IntProperty()
+    def execute(self, context):
+        if self.set_index >= len(context.scene.physics_sets): return {'CANCELLED'}
+        p_set = context.scene.physics_sets[self.set_index]
+        arm = context.object
+        related = get_related_objects_and_bones(context, p_set)
+        
+        original_mode = arm.mode if arm and arm.mode != 'OBJECT' else None
+        if bpy.context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+        for obj in related['rigids'] | related['joints']: obj.select_set(False)
+        if arm and related['bones']:
+            bpy.context.view_layer.objects.active = arm
+            bpy.ops.object.mode_set(mode='POSE')
+            for name in related['bones']:
+                if p_bone := arm.pose.bones.get(name): p_bone.bone.select = False
+        if original_mode: bpy.ops.object.mode_set(mode=original_mode)
+        return {'FINISHED'}
+
+# --- New Operators for Individual Mirroring ---
+
+class PHYSICS_OT_mirror_rigid_parameter(Operator):
+    bl_idname = "physics.mirror_rigid_parameter"
+    bl_label = "Push Parameters to Symmetric Rigid"
+    bl_description = "Copy parameters from THIS rigid body to its symmetric counterpart"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    source_rigid_name: StringProperty()
+
+    def execute(self, context):
+        src_rigid = bpy.data.objects.get(self.source_rigid_name)
+        if not src_rigid:
+            self.report({'ERROR'}, f"Source Object {self.source_rigid_name} not found.")
+            return {'CANCELLED'}
+            
+        tgt_name = get_mirror_name(self.source_rigid_name)
+        tgt_rigid = bpy.data.objects.get(tgt_name)
+        
+        if not tgt_rigid:
+            self.report({'WARNING'}, f"Symmetric target object {tgt_name} not found. Create it first.")
+            return {'CANCELLED'}
+        
+        ensure_object_selectable(tgt_rigid)
+        copy_rigid_params_core(src_rigid, tgt_rigid)
+        self.report({'INFO'}, f"Pushed parameters from {self.source_rigid_name} to {tgt_name}")
+        return {'FINISHED'}
+
+class PHYSICS_OT_mirror_joint_parameter(Operator):
+    bl_idname = "physics.mirror_joint_parameter"
+    bl_label = "Push Parameters to Symmetric Joint"
+    bl_description = "Copy parameters from THIS joint to its symmetric counterpart"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    source_joint_name: StringProperty()
+
+    def execute(self, context):
+        src_joint = bpy.data.objects.get(self.source_joint_name)
+        if not src_joint:
+            self.report({'ERROR'}, f"Source Joint {self.source_joint_name} not found.")
+            return {'CANCELLED'}
+            
+        tgt_name = get_mirror_name(self.source_joint_name)
+        tgt_joint = bpy.data.objects.get(tgt_name)
+        
+        if not tgt_joint:
+            self.report({'WARNING'}, f"Symmetric target joint {tgt_name} not found.")
+            return {'CANCELLED'}
+        
+        ensure_object_selectable(tgt_joint)
+        copy_joint_params_core(src_joint, tgt_joint)
+        self.report({'INFO'}, f"Pushed parameters from {self.source_joint_name} to {tgt_name}")
+        return {'FINISHED'}
+
+class PHYSICS_OT_mirror_selection(Operator):
+    bl_idname = "physics.mirror_selection"
+    bl_label = "Push Parameters Selected -> Symmetric"
+    bl_description = "Copy parameters from selected objects TO their symmetric counterparts"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected = context.selected_objects
+        if not selected:
+            self.report({'WARNING'}, "No objects selected.")
+            return {'CANCELLED'}
+
+        count_r = 0
+        count_j = 0
+        
+        for obj in selected:
+            # Rigid Body Mirroring: Source = obj, Target = Mirror(obj)
+            if hasattr(obj, 'mmd_rigid') and obj.mmd_rigid.type != 'NONE':
+                src_rigid = obj
+                tgt_name = get_mirror_name(src_rigid.name)
+                tgt_rigid = bpy.data.objects.get(tgt_name)
+                if tgt_rigid:
+                    ensure_object_selectable(tgt_rigid)
+                    copy_rigid_params_core(src_rigid, tgt_rigid)
+                    count_r += 1
+            
+            # Joint Mirroring: Source = obj, Target = Mirror(obj)
+            if hasattr(obj, 'mmd_joint') and hasattr(obj, 'rigid_body_constraint') and obj.rigid_body_constraint:
+                src_joint = obj
+                tgt_name = get_mirror_name(src_joint.name)
+                tgt_joint = bpy.data.objects.get(tgt_name)
+                if tgt_joint:
+                    ensure_object_selectable(tgt_joint)
+                    copy_joint_params_core(src_joint, tgt_joint)
+                    count_j += 1
+                    
+        self.report({'INFO'}, f"Pushed params: {count_r} rigids, {count_j} joints.")
+        return {'FINISHED'}
+
+class PHYSICS_OT_symmetrize_set(Operator):
+    bl_idname = "physics.symmetrize_set"
+    bl_label = "Auto Symmetrize Set"
+    bl_description = "Automatically create symmetric set, bones, rigid bodies, and joints"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context): 
+        return get_active_set(context) is not None
+
+    def execute(self, context):
+        active_set = get_active_set(context)
+        if not active_set: return {'CANCELLED'}
+        
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "Active object must be an Armature")
+            return {'CANCELLED'}
+
+        # 0. Ensure Symmetric Bones Exist
+        ensure_symmetric_bones(context, active_set)
+
+        # 1. 対称セットの確保
+        new_set_name = get_mirror_name(active_set.name)
+        if not new_set_name:
+            if ".L" in active_set.name: new_set_name = active_set.name.replace(".L", ".R")
+            elif ".R" in active_set.name: new_set_name = active_set.name.replace(".R", ".L")
+            elif "Left" in active_set.name: new_set_name = active_set.name.replace("Left", "Right")
+            elif "Right" in active_set.name: new_set_name = active_set.name.replace("Right", "Left")
+            else: new_set_name = active_set.name + "_Mirrored"
+
+        sets = context.scene.physics_sets
+        target_index = -1
+        for i, s in enumerate(sets):
+            if s.name == new_set_name:
+                target_index = i
+                break
+        
+        if target_index == -1:
+            new_set = sets.add()
+            new_set.name = new_set_name
+            target_index = len(sets) - 1
+        else:
+            new_set = sets[target_index]
+
+        if active_set.parent_bone_name:
+            m_parent = get_mirror_name(active_set.parent_bone_name)
+            new_set.parent_bone_name = m_parent if m_parent else active_set.parent_bone_name
+        
+        new_set.root_bones.clear()
+        
+        # Populate roots from mirrored bones
+        for item in active_set.root_bones:
+            m_root = get_mirror_name(item.bone_name)
+            if m_root and arm.data.bones.get(m_root):
+                exists = False
+                for existing in new_set.root_bones:
+                    if existing.bone_name == m_root: exists = True
+                if not exists:
+                    new = new_set.root_bones.add()
+                    new.bone_name = m_root
+
+        context.scene.physics_tool_settings.active_physics_set_index = target_index
+        bpy.ops.physics.build_table()
+        self.report({'INFO'}, f"Created symmetric set: {new_set.name}")
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_cell_base(Operator):
+    def invoke(self, context, event): 
+        self.use_deselect = not(event.shift or event.ctrl)
+        self.use_toggle = event.ctrl or event.alt
+        return self.execute(context)
+
+class PHYSICS_OT_select_cell(PHYSICS_OT_select_cell_base):
+    bl_idname = "physics.select_cell"
+    bl_label = "Select Bone"
+    bone_name: StringProperty()
+    def execute(self, context):
+        arm = context.object
+        bpy.ops.object.mode_set(mode='POSE')
+        if self.use_deselect: bpy.ops.pose.select_all(action='DESELECT')
+        if p := arm.pose.bones.get(self.bone_name): 
+            p.bone.select = not p.bone.select if self.use_toggle else True
+            arm.data.bones.active = p.bone
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_row(PHYSICS_OT_select_cell_base):
+    bl_idname = "physics.select_row"
+    bl_label = "Select Row"
+    row: IntProperty()
+    def execute(self, context):
+        arm = context.object
+        bpy.ops.object.mode_set(mode='POSE')
+        if self.use_deselect: bpy.ops.pose.select_all(action='DESELECT')
+        for name in (c.bone_name for c in context.scene.skirt_table if c.row == self.row):
+            if p := arm.pose.bones.get(name): p.bone.select = not p.bone.select if self.use_toggle else True
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_col(PHYSICS_OT_select_cell_base):
+    bl_idname = "physics.select_col"
+    bl_label = "Select Col"
+    col: IntProperty()
+    def execute(self, context):
+        arm = context.object
+        bpy.ops.object.mode_set(mode='POSE')
+        if self.use_deselect: bpy.ops.pose.select_all(action='DESELECT')
+        for name in (c.bone_name for c in context.scene.skirt_table if c.col == self.col):
+            if p := arm.pose.bones.get(name): p.bone.select = not p.bone.select if self.use_toggle else True
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_rigid_cell(PHYSICS_OT_select_cell_base):
+    bl_idname = "physics.select_rigid_cell"
+    bl_label = "Select Rigid"
+    bone_name: StringProperty()
+    def execute(self, context):
+        if context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+        if r := get_rigid_name_by_bone(context.scene, self.bone_name):
+            if o := bpy.data.objects.get(r):
+                if self.use_deselect: bpy.ops.object.select_all(action='DESELECT')
+                o.select_set(not o.select_get() if self.use_toggle else True)
+                context.view_layer.objects.active = o
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_rigid_row(PHYSICS_OT_select_cell_base):
+    bl_idname = "physics.select_rigid_row"
+    bl_label = "Select Rigid Row"
+    row: IntProperty()
+    def execute(self, context):
+        if context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+        if self.use_deselect: bpy.ops.object.select_all(action='DESELECT')
+        for name in (get_rigid_name_by_bone(context.scene, c.bone_name) for c in context.scene.skirt_table if c.row==self.row):
+            if o := bpy.data.objects.get(name): o.select_set(not o.select_get() if self.use_toggle else True)
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_rigid_col(PHYSICS_OT_select_cell_base):
+    bl_idname = "physics.select_rigid_col"
+    bl_label = "Select Rigid Col"
+    col: IntProperty()
+    def execute(self, context):
+        if context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+        if self.use_deselect: bpy.ops.object.select_all(action='DESELECT')
+        for name in (get_rigid_name_by_bone(context.scene, c.bone_name) for c in context.scene.skirt_table if c.col==self.col):
+            if o := bpy.data.objects.get(name): o.select_set(not o.select_get() if self.use_toggle else True)
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_joint_cell(PHYSICS_OT_select_cell_base):
+    bl_idname = "physics.select_joint_cell"
+    bl_label = "Select Joint"
+    joint_name: StringProperty()
+    def execute(self, context):
+        if context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+        if j := bpy.data.objects.get(self.joint_name):
+            if self.use_deselect: bpy.ops.object.select_all(action='DESELECT')
+            j.select_set(not j.select_get() if self.use_toggle else True)
+            context.view_layer.objects.active = j
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_joint_row(PHYSICS_OT_select_cell_base):
+    bl_idname = "physics.select_joint_row"
+    bl_label = "Select Row"
+    row: IntProperty()
+    joint_type: EnumProperty(items=[('LATERAL',"L",""),('VERTICAL',"V","")])
+    def execute(self, context):
+        if context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+        if self.use_deselect: bpy.ops.object.select_all(action='DESELECT')
+        _, _, lat, ver = build_joint_display_maps(context)
+        m = lat if self.joint_type=='LATERAL' else ver
+        for (r, _), j in m.items():
+            if r == self.row: j.select_set(not j.select_get() if self.use_toggle else True)
+        return {'FINISHED'}
+
+class PHYSICS_OT_select_joint_col(PHYSICS_OT_select_cell_base):
+    bl_idname = "physics.select_joint_col"
+    bl_label = "Select Col"
+    col: IntProperty()
+    joint_type: EnumProperty(items=[('LATERAL',"L",""),('VERTICAL',"V","")])
+    def execute(self, context):
+        if context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+        if self.use_deselect: bpy.ops.object.select_all(action='DESELECT')
+        _, _, lat, ver = build_joint_display_maps(context)
+        m = lat if self.joint_type=='LATERAL' else ver
+        for (_, c), j in m.items():
+            if c == self.col: j.select_set(not j.select_get() if self.use_toggle else True)
+        return {'FINISHED'}
+
+class PHYSICS_OT_create_joints_base(Operator):
+    bl_options={'REGISTER','UNDO'}
+    direction: EnumProperty(items=[('HORIZONTAL',"H",""),('VERTICAL',"V","")])
+    
+    def create_joint_logic(self, context, rigid_bodies):
+        scene = context.scene
+        settings = scene.physics_tool_settings
+        active_set = get_active_set(context)
+        
+        b2c = {(c.bone_name): (c.row, c.col) for c in scene.skirt_table}
+        r2c = {i.rigid_name: b2c[i.bone_name] for i in scene.skirt_rigid_map if i.bone_name in b2c}
+        
+        group_idx = 0 if self.direction=='HORIZONTAL' else 1
+        groups = defaultdict(list)
+        for r in rigid_bodies:
+            if r.name in r2c: groups[r2c[r.name][group_idx]].append(r)
+            
+        count = 0
+        sort_idx = 1 if self.direction=='HORIZONTAL' else 0
+        prefix = "J.LAT_" if self.direction=='HORIZONTAL' else "J."
+        
+        parent_rigid = None
+        if self.direction == 'VERTICAL' and active_set and active_set.parent_bone_name:
+             if pname := get_rigid_name_by_bone(scene, active_set.parent_bone_name):
+                 parent_rigid = bpy.data.objects.get(pname)
+        
+        for group in groups.values():
+            if not group: continue
+            
+            s_rigids = sorted(group, key=lambda r: r2c.get(r.name,(9e9,9e9))[sort_idx])
+            
+            if self.direction == 'VERTICAL' and parent_rigid and s_rigids:
+                first_coords = r2c.get(s_rigids[0].name)
+                if first_coords and first_coords[0] == 0:
+                    _, err = create_and_rename_joint(context, parent_rigid, s_rigids[0], "J.Parent_")
+                    if not err: count += 1
+
+            if len(s_rigids) < 2: continue
+            pairs = [(s_rigids[i], s_rigids[i+1]) for i in range(len(s_rigids)-1)]
+            if settings.loop_joints: pairs.append((s_rigids[-1], s_rigids[0]))
+            
+            for o1, o2 in pairs:
+                _, err = create_and_rename_joint(context, o1, o2, prefix)
+                if err: 
+                    self.report({'ERROR'}, err)
+                    return -1
+                count += 1
+        return count
+
+class PHYSICS_OT_create_joints(PHYSICS_OT_create_joints_base):
+    bl_idname="physics.create_joints"
+    bl_label="Create Joints for Selected"
+    def execute(self,context):
+        original=[o for o in context.selected_objects if o]
+        selected=[o for o in original if hasattr(o,'mmd_rigid') and o.mmd_rigid.type!='NONE']
+        
+        if len(selected) < 2 and self.direction == 'HORIZONTAL': 
+            self.report({'WARNING'}, "Select at least 2 rigid bodies")
+            return {'CANCELLED'}
+            
+        count = self.create_joint_logic(context, selected)
+        if count < 0: return {'CANCELLED'}
+        self.report({'INFO'}, f"Created {count} joints")
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in original: 
+            if o: o.select_set(True)
+        return {'FINISHED'}
+
+class PHYSICS_OT_create_table_joints(PHYSICS_OT_create_joints_base):
+    bl_idname="physics.create_table_joints"
+    bl_label="Create Joints for Table"
+    def execute(self,context):
+        scene = context.scene
+        if not scene.skirt_table or not scene.skirt_rigid_map: 
+            self.report({'WARNING'}, "Build table & scan rigids first")
+            return {'CANCELLED'}
+        bone_names = {c.bone_name for c in scene.skirt_table}
+        rigid_names = {i.rigid_name for i in scene.skirt_rigid_map if i.bone_name in bone_names}
+        rigids = [bpy.data.objects.get(name) for name in rigid_names if bpy.data.objects.get(name)]
+        
+        count = self.create_joint_logic(context, rigids)
+        if count < 0: return {'CANCELLED'}
+        self.report({'INFO'}, f"Created {count} joints")
+        bpy.ops.object.select_all(action='DESELECT')
+        return {'FINISHED'}
+
+class PHYSICS_OT_refresh_ui(Operator):
+    bl_idname="physics.refresh_ui"
+    bl_label="Refresh UI"
+    def execute(self,context):
+        self.report({'INFO'}, "UI Refreshed")
+        return {'FINISHED'}
+
+class PHYSICS_OT_create_rigids_for_selection(Operator):
+    bl_idname = "physics.create_rigids_from_bones"
+    bl_label = "Create Rigids from Selected Bones"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    # 独自プロパティの定義 (MMD Toolsの設定を模倣)
+    rigid_type: EnumProperty(
+        name="Type",
+        items=[
+            ('1', "Bone", ""),
+            ('2', "Physics", ""),
+            ('3', "Physics + Bone", ""),
+        ],
+        default='2'
+    )
+    rigid_shape: EnumProperty(
+        name="Shape",
+        items=[
+            ('SPHERE', "Sphere", ""),
+            ('BOX', "Box", ""),
+            ('CAPSULE', "Capsule", ""),
+        ],
+        default='CAPSULE'
+    )
+    rigid_size: FloatVectorProperty(
+        name="Size",
+        subtype='XYZ',
+        default=(0.5, 0.5, 0.5)
+    )
+
+    @classmethod
+    def poll(cls, context): 
+        return context.object and context.object.type == 'ARMATURE'
+
+    def invoke(self, context, event):
+        # ダイアログを表示し、ユーザーの設定を待つ
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        if not hasattr(bpy.ops.mmd_tools, 'rigid_body_add'): 
+            self.report({'ERROR'}, "mmd_tools not found.")
+            return {'CANCELLED'}
+            
+        active_set = get_active_set(context)
+        parent_bone = active_set.parent_bone_name if active_set else None
+        
+        bpy.ops.object.mode_set(mode='POSE')
+        if not context.selected_pose_bones: 
+            self.report({'WARNING'}, "No bones selected in Pose Mode.")
+            return {'CANCELLED'}
+        
+        target_bone_names = {pb.name for pb in context.selected_pose_bones}
+            
+        # 1. ユーザー入力を無視して一旦デフォルト設定で作成 (ダイアログを出さずに実行)
+        bpy.ops.mmd_tools.rigid_body_add('EXEC_DEFAULT')
+        
+        # 2. 作成された剛体に対して、ユーザーがダイアログで指定した設定を適用する + リネーム
+        for obj in context.scene.objects:
+            if hasattr(obj, 'mmd_rigid') and obj.mmd_rigid.type != 'NONE':
+                if obj.mmd_rigid.bone in target_bone_names:
+                    # 接頭辞の付与
+                    if not obj.name.startswith("RB_"):
+                        obj.name = f"RB_{obj.name}"
+                    
+                    # ユーザー設定の適用
+                    obj.mmd_rigid.type = self.rigid_type
+                    obj.mmd_rigid.shape = self.rigid_shape
+                    # サイズはXYZベクトルなのでコピー
+                    obj.mmd_rigid.size = self.rigid_size
+
+        # 親ボーン用剛体の特別設定（こちらは固定）
+        if parent_bone:
+            for obj in context.scene.objects:
+                if hasattr(obj, 'mmd_rigid') and obj.mmd_rigid.bone == parent_bone:
+                    obj.mmd_rigid.type = '1' # Static
+                    obj.mmd_rigid.collision_group_number = 15
+                    for i in range(16):
+                        obj.mmd_rigid.collision_group_mask[i] = False
+                        
+        bpy.ops.physics.scan_rigids('INVOKE_DEFAULT')
+        return {'FINISHED'}
+
+class PHYSICS_OT_prefix_rigids(Operator):
+    bl_idname = "physics.prefix_rigids"
+    bl_label = "Add Prefix RB_"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        count = 0
+        target_objects = []
+        for item in scene.skirt_rigid_map:
+            obj = bpy.data.objects.get(item.rigid_name)
+            if obj and not obj.name.startswith("RB_"):
+                target_objects.append(obj)
+        
+        for obj in target_objects:
+            obj.name = f"RB_{obj.name}"
+            count += 1
+            
+        bpy.ops.physics.scan_rigids('INVOKE_DEFAULT')
+        self.report({'INFO'}, f"Added 'RB_' prefix to {count} rigid bodies.")
+        return {'FINISHED'}
+
+class PHYSICS_OT_copy_rigid_settings(Operator):
+    bl_idname = "physics.copy_rigid_settings"
+    bl_label = "Copy Rigid Body Settings"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, context):
+        active_obj = context.active_object
+        if not active_obj or not hasattr(active_obj, 'mmd_rigid') or not active_obj.rigid_body: return False
+        return any(obj != active_obj and hasattr(obj, 'mmd_rigid') for obj in context.selected_objects)
+    def execute(self, context):
+        source_obj = context.active_object
+        source_mmd = source_obj.mmd_rigid
+        source_rb = source_obj.rigid_body
+        settings = context.scene.physics_tool_settings.rigid_copy_settings
+        targets = [obj for obj in context.selected_objects if obj != source_obj and hasattr(obj, 'mmd_rigid')]
+
+        for target_obj in targets:
+            target_mmd = target_obj.mmd_rigid
+            target_rb = target_obj.rigid_body
+            if not target_rb: continue
+
+            if settings.copy_type: target_mmd.type = source_mmd.type
+            if settings.copy_shape: target_mmd.shape = source_mmd.shape
+            if settings.copy_size: target_mmd.size = source_mmd.size
+            if settings.copy_mass: target_rb.mass = source_rb.mass
+            if settings.copy_friction: target_rb.friction = source_rb.friction
+            if settings.copy_restitution: target_rb.restitution = source_rb.restitution
+            if settings.copy_collision_group: target_mmd.collision_group_number = source_mmd.collision_group_number
+            if settings.copy_collision_mask: target_mmd.collision_group_mask = source_mmd.collision_group_mask
+            
+        self.report({'INFO'}, f"Copied rigid settings to {len(targets)} object(s).")
+        return {'FINISHED'}
+
+class PHYSICS_OT_copy_joint_settings(Operator):
+    bl_idname = "physics.copy_joint_settings"
+    bl_label = "Copy Joint Settings"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, context):
+        active_obj = context.active_object
+        if not active_obj or not hasattr(active_obj, 'mmd_joint'): return False
+        return any(obj != active_obj and hasattr(obj, 'mmd_joint') for obj in context.selected_objects)
+    def execute(self, context):
+        source = context.active_object
+        settings = context.scene.physics_tool_settings.joint_copy_settings
+        targets = [obj for obj in context.selected_objects if obj != source and hasattr(obj, 'mmd_joint')]
+        for target_obj in targets:
+            src_mmd = source.mmd_joint
+            tgt_mmd = target_obj.mmd_joint
+            src_rbc = source.rigid_body_constraint
+            tgt_rbc = target_obj.rigid_body_constraint
+            
+            if settings.copy_springs_linear and hasattr(tgt_mmd, 'spring_linear'):
+                tgt_mmd.spring_linear = src_mmd.spring_linear
+            if settings.copy_springs_angular and hasattr(tgt_mmd, 'spring_angular'):
+                tgt_mmd.spring_angular = src_mmd.spring_angular
+                
+            if src_rbc and tgt_rbc:
+                if settings.copy_limits_linear:
+                    tgt_rbc.use_limit_lin_x=src_rbc.use_limit_lin_x
+                    tgt_rbc.limit_lin_x_lower=src_rbc.limit_lin_x_lower; tgt_rbc.limit_lin_x_upper=src_rbc.limit_lin_x_upper
+                    tgt_rbc.use_limit_lin_y=src_rbc.use_limit_lin_y
+                    tgt_rbc.limit_lin_y_lower=src_rbc.limit_lin_y_lower; tgt_rbc.limit_lin_y_upper=src_rbc.limit_lin_y_upper
+                    tgt_rbc.use_limit_lin_z=src_rbc.use_limit_lin_z
+                    tgt_rbc.limit_lin_z_lower=src_rbc.limit_lin_z_lower; tgt_rbc.limit_lin_z_upper=src_rbc.limit_lin_z_upper
+                if settings.copy_limits_angular:
+                    tgt_rbc.use_limit_ang_x=src_rbc.use_limit_ang_x
+                    tgt_rbc.limit_ang_x_lower=src_rbc.limit_ang_x_lower; tgt_rbc.limit_ang_x_upper=src_rbc.limit_ang_x_upper
+                    tgt_rbc.use_limit_ang_y=src_rbc.use_limit_ang_y
+                    tgt_rbc.limit_ang_y_lower=src_rbc.limit_ang_y_lower; tgt_rbc.limit_ang_y_upper=src_rbc.limit_ang_y_upper
+                    tgt_rbc.use_limit_ang_z=src_rbc.use_limit_ang_z
+                    tgt_rbc.limit_ang_z_lower=src_rbc.limit_ang_z_lower; tgt_rbc.limit_ang_z_upper=src_rbc.limit_ang_z_upper
+        self.report({'INFO'}, f"Copied joint settings to {len(targets)} object(s).")
+        return {'FINISHED'}
+
+# -------------------------
+# UI List Classes
+# -------------------------
+class PHYSICS_UL_set_list(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row=layout.row(align=True);row.prop(item,"name",text="",emboss=False,icon='PHYSICS')
+        row.operator("physics.toggle_visibility",text="",emboss=False,icon='HIDE_OFF' if item.show_in_viewport else 'HIDE_ON')
+        row.operator("physics.toggle_selectability",text="",emboss=False,icon='RESTRICT_SELECT_OFF' if item.is_selectable else 'RESTRICT_SELECT_ON')
+        row.separator()
+        op_sel=row.operator("physics.select_set_items",text="",emboss=False,icon='SELECT_SET');op_sel.set_index=index
+        op_desel=row.operator("physics.deselect_set_items",text="",emboss=False,icon='SELECT_SUBTRACT');op_desel.set_index=index
+
+class PHYSICS_UL_root_list(UIList):
+    def draw_item(self,c,l,d,i,ic,ad,ap):l.prop(i,"bone_name",text="",emboss=False)
+
+# --- UI Panel ---
+class PHYSICS_PT_main(Panel):
+    bl_label="MMD Chain Physics Helper"
+    bl_idname="PHYSICS_PT_main"
+    bl_space_type='VIEW_3D'
+    bl_region_type='UI'
+    bl_category="MMD"
+    
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        settings = scene.physics_tool_settings
+        
+        box = layout.box()
+        box.label(text="Physics Sets", icon='GROUP')
+        row = box.row()
+        row.template_list("PHYSICS_UL_set_list", "", scene, "physics_sets", settings, "active_physics_set_index")
+        col=row.column(align=True)
+        col.operator("physics.add_set",text="",icon='ADD')
+        col.operator("physics.remove_set",text="",icon='REMOVE')
+        col.separator()
+        col.operator("physics.move_set",text="",icon='TRIA_UP').direction='UP'
+        col.operator("physics.move_set",text="",icon='TRIA_DOWN').direction='DOWN'
+        layout.operator("physics.symmetrize_set", icon='MOD_MIRROR')
+        
+        active_set = get_active_set(context)
+        if not active_set:
+            layout.separator()
+        else:
+            # --- ROOT BONES & PARENT ---
+            box = layout.box()
+            row = box.row(align=True)
+            row.label(text="1. Bones", icon='BONE_DATA')
+            row.operator("physics.build_table", icon='FILE_REFRESH', text="Rebuild")
+
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(active_set, "parent_bone_name", text="Parent", icon='CONSTRAINT_BONE')
+            row.operator("physics.set_parent_bone", text="", icon='EYEDROPPER')
+
+            box.label(text="Root Bones:")
+            box.operator("physics.add_root_from_selection", text="Add Roots from Selection")
+            row = box.row()
+            row.template_list("PHYSICS_UL_root_list", "", active_set, "root_bones", active_set, "active_root_index")
+            col = row.column(align=True)
+            col.operator("physics.move_root", text="", icon='TRIA_UP').direction='UP'
+            col.operator("physics.move_root", text="", icon='TRIA_DOWN').direction='DOWN'
+            
+            # Bone Table
+            if scene.skirt_table:
+                max_r = max((c.row for c in scene.skirt_table), default=-1) + 1
+                max_c = max((c.col for c in scene.skirt_table), default=-1) + 1
+                c_map = {(c.row, c.col): c for c in scene.skirt_table}
+                
+                t_box = box.box()
+                t_box.label(text="Bone Table")
+                header = t_box.row(align=True)
+                header.label(text="")
+                for c in range(max_c):
+                    op = header.operator("physics.select_col", text=f"C{c}")
+                    op.col = c
+                for r in range(max_r):
+                    row_ui = t_box.row(align=True)
+                    op = row_ui.operator("physics.select_row", text=f"{r:03}")
+                    op.row = r
+                    for c in range(max_c):
+                        if cell := c_map.get((r,c)): 
+                            op = row_ui.operator("physics.select_cell", text=cell.bone_name)
+                            op.bone_name = cell.bone_name
+                        else: row_ui.label(text="")
+        
+            # --- RIGID BODIES ---
+            box = layout.box()
+            sub_row = box.row(align=True)
+            sub_row.label(text="2. Rigid Bodies", icon='RIGID_BODY')
+            sub_row.operator("physics.create_rigids_from_bones", text="Create All", icon='ADD')
+            sub_row.operator("physics.prefix_rigids", text="Add RB_", icon='TEXT')
+            sub_row.operator("physics.scan_rigids", text="Rescan", icon='FILE_REFRESH')
+            sub_row.operator("physics.mirror_selection", text="", icon='MOD_MIRROR') # New Mirror Button
+            
+            # Parent Rigid Display
+            if active_set.parent_bone_name:
+                p_rigid = get_rigid_name_by_bone(scene, active_set.parent_bone_name)
+                p_box = box.box()
+                row = p_box.row(align=True)
+                row.label(text="Parent Rigid:")
+                if p_rigid:
+                    op = row.operator("physics.select_rigid_cell", text=p_rigid, icon='LINKED')
+                    op.bone_name = active_set.parent_bone_name
+                    # Parent Rigid Mirror Button
+                    m_op = row.operator("physics.mirror_rigid_parameter", text="", icon='Arrow_Left_Right' if bpy.app.version < (4,0,0) else 'MOD_MIRROR') 
+                    m_op.source_rigid_name = p_rigid
+                else:
+                    row.label(text="Not Created", icon='ERROR')
+
+            if scene.skirt_rigid_map and scene.skirt_table and 'max_c' in locals():
+                t_box = box.box()
+                t_box.label(text="Rigid Body Table")
+                header = t_box.row(align=True)
+                header.label(text="")
+                for c in range(max_c):
+                    op = header.operator("physics.select_rigid_col", text=f"C{c}")
+                    op.col = c
+                for r in range(max_r):
+                    row_ui = t_box.row(align=True)
+                    op = row_ui.operator("physics.select_rigid_row", text=f"{r:03}")
+                    op.row = r
+                    for c in range(max_c):
+                        if cell := c_map.get((r,c)):
+                            if rn := get_rigid_name_by_bone(scene, cell.bone_name): 
+                                op = row_ui.operator("physics.select_rigid_cell", text=rn)
+                                op.bone_name = cell.bone_name
+                            else: row_ui.label(text="-")
+                        else: row_ui.label(text="-")
+        
+            # --- JOINTS ---
+            mb = layout.box()
+            mb.label(text="3. Joint Creation", icon='CONSTRAINT')
+            mb.prop(settings, "loop_joints")
+            
+            b = mb.box()
+            b.label(text="Creation:")
+            r = b.row(align=True)
+            h = r.operator("physics.create_joints", text="H", icon='ARROW_LEFTRIGHT'); h.direction='HORIZONTAL'
+            v = r.operator("physics.create_joints", text="V", icon='TRIA_DOWN'); v.direction='VERTICAL'
+            r = b.row(align=True)
+            ah = r.operator("physics.create_table_joints", text="All H", icon='CON_TRANSLIKE'); ah.direction='HORIZONTAL'
+            av = r.operator("physics.create_table_joints", text="All V", icon='CON_ROTLIKE'); av.direction='VERTICAL'
+
+            # Table Display for Joints
+            if scene.skirt_table and 'max_c' in locals():
+                mb = layout.box()
+                r = mb.row(align=True)
+                r.label(text="4. Joint Connections", icon='LINKED')
+                r.operator("physics.refresh_ui", text="", icon='FILE_REFRESH')
+                r.operator("physics.mirror_selection", text="", icon='MOD_MIRROR') # New Mirror Button
+                
+                lat_d, vert_d, lat_j, vert_j = build_joint_display_maps(context)
+                
+                b = mb.box()
+                b.label(text="Horizontal Joints", icon='ARROW_LEFTRIGHT')
+                h = b.row(align=True); h.label(text="")
+                for c in range(max_c): 
+                    op = h.operator("physics.select_joint_col", text=f"C{c}"); op.col = c; op.joint_type='LATERAL'
+                for r in range(max_r):
+                    ru = b.row(align=True)
+                    op = ru.operator("physics.select_joint_row", text=f"{r:03}"); op.row = r; op.joint_type='LATERAL'
+                    for c in range(max_c): 
+                        if j := lat_j.get((r,c)): 
+                            op = ru.operator("physics.select_joint_cell", text=lat_d.get((r,c), j.name)); op.joint_name = j.name
+                        else: ru.label(text="-")
+                
+                b = mb.box()
+                b.label(text="Vertical Joints", icon='TRIA_DOWN')
+                h = b.row(align=True); h.label(text="")
+                for c in range(max_c): 
+                    op = h.operator("physics.select_joint_col", text=f"C{c}"); op.col = c; op.joint_type='VERTICAL'
+                for r in range(max_r):
+                    ru = b.row(align=True)
+                    op = ru.operator("physics.select_joint_row", text=f"{r:03}"); op.row = r; op.joint_type='VERTICAL'
+                    for c in range(max_c):
+                        if j := vert_j.get((r,c)): 
+                            op = ru.operator("physics.select_joint_cell", text=vert_d.get((r,c), j.name)); op.joint_name = j.name
+                        else: ru.label(text="-")
+
+        # --- COPY SETTINGS ---
+        box = layout.box()
+        box.label(text="Copy Active's Settings", icon='COPY_ID')
+        
+        rigid_box = box.box()
+        row = rigid_box.row()
+        row.label(text="Rigid Body")
+        row.enabled = PHYSICS_OT_copy_rigid_settings.poll(context)
+        row.operator("physics.copy_rigid_settings", text="Copy to Selected")
+        grid = rigid_box.grid_flow(row_major=True, columns=2, align=True)
+        rigid_settings = settings.rigid_copy_settings
+        grid.prop(rigid_settings, "copy_type")
+        grid.prop(rigid_settings, "copy_shape")
+        grid.prop(rigid_settings, "copy_size")
+        grid.prop(rigid_settings, "copy_mass")
+        grid.prop(rigid_settings, "copy_friction")
+        grid.prop(rigid_settings, "copy_restitution")
+        grid.prop(rigid_settings, "copy_collision_group")
+        grid.prop(rigid_settings, "copy_collision_mask")
+        
+        joint_box = box.box()
+        row = joint_box.row()
+        row.label(text="Joint")
+        row.enabled = PHYSICS_OT_copy_joint_settings.poll(context)
+        row.operator("physics.copy_joint_settings", text="Copy to Selected")
+        grid = joint_box.grid_flow(row_major=True, columns=2, align=True)
+        joint_settings = settings.joint_copy_settings
+        grid.prop(joint_settings, "copy_limits_linear")
+        grid.prop(joint_settings, "copy_limits_angular")
+        grid.prop(joint_settings, "copy_springs_linear")
+        grid.prop(joint_settings, "copy_springs_angular")
+
+# -------------------------
+# Registration
+# -------------------------
+classes = (
+    PhysicsRootItem, PhysicsSet, RigidCopySettings, JointCopySettings, GlobalPhysicsSettings, SkirtTableCell, SkirtRigidMapItem,
+    PHYSICS_OT_add_set, PHYSICS_OT_remove_set, PHYSICS_OT_move_set,
+    PHYSICS_OT_toggle_visibility, PHYSICS_OT_toggle_selectability,
+    PHYSICS_OT_select_set_items, PHYSICS_OT_deselect_set_items, 
+    PHYSICS_OT_symmetrize_set,
+    PHYSICS_OT_set_parent_bone,
+    PHYSICS_OT_add_root_from_selection, PHYSICS_OT_move_root, PHYSICS_OT_build_table, PHYSICS_OT_scan_rigids,
+    PHYSICS_OT_create_rigids_for_selection, PHYSICS_OT_prefix_rigids,
+    PHYSICS_OT_copy_rigid_settings, PHYSICS_OT_copy_joint_settings,
+    PHYSICS_OT_select_cell, PHYSICS_OT_select_row, PHYSICS_OT_select_col,
+    PHYSICS_OT_select_rigid_cell, PHYSICS_OT_select_rigid_row, PHYSICS_OT_select_rigid_col,
+    PHYSICS_OT_select_joint_cell, PHYSICS_OT_select_joint_row, PHYSICS_OT_select_joint_col,
+    PHYSICS_OT_create_joints, PHYSICS_OT_create_table_joints, PHYSICS_OT_refresh_ui,
+    PHYSICS_OT_mirror_selection, PHYSICS_OT_mirror_rigid_parameter, PHYSICS_OT_mirror_joint_parameter,
+    PHYSICS_UL_set_list, PHYSICS_UL_root_list, PHYSICS_PT_main,
+)
+
+def register():
+    unregister_legacy()
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.physics_tool_settings = PointerProperty(type=GlobalPhysicsSettings)
+    bpy.types.Scene.physics_sets = CollectionProperty(type=PhysicsSet)
+    bpy.types.Scene.skirt_table = CollectionProperty(type=SkirtTableCell)
+    bpy.types.Scene.skirt_rigid_map = CollectionProperty(type=SkirtRigidMapItem)
+
+def unregister():
+    for cls in reversed(classes):
+        if hasattr(bpy.types, cls.__name__):
+            bpy.utils.unregister_class(cls)
+    props = ["physics_tool_settings", "physics_sets", "skirt_table", "skirt_rigid_map"]
+    for p in props:
+        if hasattr(bpy.types.Scene, p): delattr(bpy.types.Scene, p)
+
+def unregister_legacy():
+    props = ["skirt_tool_settings", "skirt_root_order", "skirt_root_index"]
+    for p in props:
+        if hasattr(bpy.types.Scene, p): delattr(bpy.types.Scene, p)
+
+if __name__ == "__main__":
+    try: unregister()
+    except Exception: pass
+    register()
